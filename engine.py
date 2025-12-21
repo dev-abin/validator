@@ -4,10 +4,23 @@ from lxml import etree
 
 
 # =========================
+# EXCEPTIONS
+# =========================
+
+class ContextBudgetExceeded(Exception):
+    pass
+
+
+# =========================
 # FAILURE CLASSIFICATION
 # =========================
 
 def is_cross_cutting(failure: dict) -> bool:
+    """
+    Cross-cutting if:
+    - explicitly marked global
+    - or multiple templates involved
+    """
     return (
         failure.get("is_global", False)
         or len(failure.get("templates_involved", [])) > 1
@@ -15,6 +28,10 @@ def is_cross_cutting(failure: dict) -> bool:
 
 
 def cluster_failures(failures: list[dict]):
+    """
+    Group failures by template_id.
+    Cross-cutting failures are deferred.
+    """
     clusters = {}
     deferred = []
 
@@ -44,12 +61,62 @@ TYPE_PRIORITY = {
 
 
 def prioritize_failures(failures: list[dict]) -> list[dict]:
+    """
+    Order failures so that:
+    - structural before value
+    - parent before child
+    """
     def key(f):
         return (
             TYPE_PRIORITY.get(f["type"], 99),
             f["xpath"].count("/")
         )
+
     return sorted(failures, key=key)
+
+
+# =========================
+# CONTEXT BUDGET
+# =========================
+
+def estimate_context_cost(
+    template: str,
+    dependencies: str,
+    failures: list[dict],
+    input_slice: str | None = None,
+    target_slice: str | None = None,
+) -> int:
+    """
+    Rough, safe context estimate in lines.
+    """
+    cost = 0
+    cost += template.count("\n")
+    cost += dependencies.count("\n")
+
+    for _ in failures:
+        cost += 3  # spec + failure metadata
+
+    if input_slice:
+        cost += input_slice.count("\n")
+    if target_slice:
+        cost += target_slice.count("\n")
+
+    return cost
+
+
+def enforce_context_budget(state, job):
+    actual = estimate_context_cost(
+        template=job["template"],
+        dependencies=job["dependencies"],
+        failures=job["failures"],
+        input_slice=job.get("input_slice"),
+        target_slice=job.get("target_slice"),
+    )
+
+    if actual > state.context_budget["max_xslt_lines"]:
+        raise ContextBudgetExceeded(
+            f"context too large: {actual}"
+        )
 
 
 # =========================
@@ -57,22 +124,35 @@ def prioritize_failures(failures: list[dict]) -> list[dict]:
 # =========================
 
 def select_template_to_fix(state):
-    candidates = [
-        (tid, fails)
-        for tid, fails in state.failure_clusters.items()
-        if tid not in state.locked_templates
-    ]
+    """
+    Pick the highest-impact template that fits context budget.
+    """
+    ranked = sorted(
+        state.failure_clusters.items(),
+        key=lambda x: len(x[1]),
+        reverse=True
+    )
 
-    if not candidates:
-        return {}
+    for tid, failures in ranked:
+        if tid in state.locked_templates:
+            continue
 
-    # highest impact first
-    tid, fails = max(candidates, key=lambda x: len(x[1]))
+        template = extract_template(state.xslt, tid)
+        deps = resolve_dependencies(state.xslt, template)
 
-    return {
-        "template_id": tid,
-        "failures": fails
-    }
+        estimated = estimate_context_cost(
+            template=template,
+            dependencies=deps,
+            failures=failures
+        )
+
+        if estimated <= state.context_budget["max_xslt_lines"]:
+            return {
+                "template_id": tid,
+                "failures": failures
+            }
+
+    return {}
 
 
 # =========================
@@ -80,6 +160,9 @@ def select_template_to_fix(state):
 # =========================
 
 def extract_template(xslt: str, template_id: str) -> str:
+    """
+    Extract one xsl:template by internal template_id.
+    """
     pattern = rf'(<xsl:template[^>]+{template_id}[^>]*>.*?</xsl:template>)'
     match = re.search(pattern, xslt, re.DOTALL)
     if not match:
@@ -96,7 +179,7 @@ def replace_template(xslt: str, template_id: str, new_template: str) -> str:
 # XML SLICING
 # =========================
 
-def slice_input_xml(input_xml: str, match_expr: str, limit=5) -> str:
+def slice_input_xml(input_xml: str, match_expr: str, limit=3) -> str:
     root = etree.fromstring(input_xml.encode())
     nodes = root.xpath(f"//{match_expr}")
 
@@ -107,7 +190,7 @@ def slice_input_xml(input_xml: str, match_expr: str, limit=5) -> str:
     return etree.tostring(wrapper, pretty_print=True).decode()
 
 
-def slice_target_xml(target_xml: str, output_xpath: str, limit=5) -> str:
+def slice_target_xml(target_xml: str, output_xpath: str, limit=3) -> str:
     root = etree.fromstring(target_xml.encode())
     nodes = root.xpath(output_xpath)
 
@@ -157,12 +240,12 @@ def build_harness_xslt(template: str, dependencies: str) -> str:
 # =========================
 
 def validate_llm_output(proposed: str, dependencies: str) -> None:
-    # dependency immutability
+    # dependencies must not be touched
     for dep in re.findall(r'<xsl:(template|variable).*?>', dependencies):
         if dep in proposed:
             raise ValueError("LLM modified dependency section")
 
-    # scope widening
+    # forbid global XPath widening
     if "//" in proposed:
         raise ValueError("XPath scope widening detected")
 
@@ -172,6 +255,9 @@ def validate_llm_output(proposed: str, dependencies: str) -> None:
 # =========================
 
 def analyze_failures(state):
+    """
+    Run XSLT and validate against specs.
+    """
     output_xml = apply_xslt(state.input_xml, state.xslt)
     failures = []
 

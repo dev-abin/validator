@@ -1,6 +1,10 @@
 import engine
 
 
+# =========================
+# ANALYSIS
+# =========================
+
 def transform_and_analyze(state):
     state._raw_failures = engine.analyze_failures(state)
     return state
@@ -12,6 +16,10 @@ def classify_and_cluster(state):
     state.deferred_cross_cutting.extend(deferred)
     return state
 
+
+# =========================
+# SELECTION & ORDERING
+# =========================
 
 def select_batch_target(state):
     state.active_job = engine.select_template_to_fix(state)
@@ -26,27 +34,52 @@ def prioritize_batch(state):
     return state
 
 
+# =========================
+# HARNESS CREATION
+# =========================
+
 def create_harness(state):
     job = state.active_job
     if not job:
         return state
 
     tid = job["template_id"]
+
     template = engine.extract_template(state.xslt, tid)
     deps = engine.resolve_dependencies(state.xslt, template)
 
+    job["template"] = template
     job["dependencies"] = deps
-    job["harness_xslt"] = engine.build_harness_xslt(template, deps)
 
-    match_expr = tid  # assumes template_id == match
-    job["input_slice"] = engine.slice_input_xml(state.input_xml, match_expr)
+    job["input_slice"] = engine.slice_input_xml(
+        state.input_xml,
+        tid,
+        limit=3
+    )
+
     job["target_slice"] = engine.slice_target_xml(
         state.target_xml,
-        job["failures"][0]["xpath"]
+        job["failures"][0]["xpath"],
+        limit=3
     )
+
+    job["harness_xslt"] = engine.build_harness_xslt(
+        template,
+        deps
+    )
+
+    # SECOND CONTEXT CHECK (hard gate)
+    try:
+        engine.enforce_context_budget(state, job)
+    except engine.ContextBudgetExceeded:
+        job.clear()
 
     return state
 
+
+# =========================
+# LLM & VERIFICATION
+# =========================
 
 def llm_batch_fix(state):
     job = state.active_job
@@ -57,7 +90,7 @@ def llm_batch_fix(state):
         "template": job["harness_xslt"],
         "failures": job["failures"],
         "input": job["input_slice"],
-        "target": job["target_slice"]
+        "target": job["target_slice"],
     }
 
     job["proposed_template"] = call_llm(prompt)
@@ -74,10 +107,19 @@ def verify_harness(state):
         job["dependencies"]
     )
 
-    apply_xslt(job["input_slice"], job["proposed_template"])
+    # compile + execute on slice
+    apply_xslt(
+        job["input_slice"],
+        job["proposed_template"]
+    )
+
     job["verified"] = True
     return state
 
+
+# =========================
+# APPLY & LOCK
+# =========================
 
 def apply_and_lock(state):
     job = state.active_job
@@ -90,12 +132,16 @@ def apply_and_lock(state):
         job["proposed_template"]
     )
 
-    # re-run validation for this template
+    # lock if all failures resolved
     if not job["failures"]:
         state.locked_templates.append(job["template_id"])
 
     return state
 
+
+# =========================
+# TERMINATION
+# =========================
 
 def check_termination(state):
     state.iteration += 1
