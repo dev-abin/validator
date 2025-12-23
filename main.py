@@ -1,67 +1,42 @@
-from state import FixState
+from lxml import etree
 from xslt_runner import run_xslt
 from xml_diff import diff_xml
-from spec_matcher import match_specs
-from xslt_slicer import (
-    find_producing_nodes,
-    expand_to_safe_boundary,
-    extract_slice
-)
+from diff_cluster import cluster_diffs
+from xslt_slice import find_slice
 from llm_fix import llm_fix_slice
-from merger import merge_slice
-from termination import check_termination
-from lxml import etree
+from tree_merge import tree_merge
+from termination import should_continue
 
-
-def fix_xslt(xslt, input_xml, target_xml, specs, max_iters=10):
-    state = FixState(xslt, input_xml, target_xml, specs)
+def fix_xslt(xslt_str, input_xml, target_xml, specs, max_iters=5):
+    xslt_tree = etree.XML(xslt_str.encode())
+    seen_clusters = set()
 
     for _ in range(max_iters):
-        state.output_xml = run_xslt(state.xslt, state.input_xml)
-        state.diffs = diff_xml(state.output_xml, state.target_xml)
+        output = run_xslt(xslt_tree, input_xml)
+        diffs = diff_xml(output, target_xml)
 
-        if not state.diffs:
-            state.status = "DONE"
-            break
+        if not diffs:
+            return xslt_tree, "SUCCESS"
 
-        for d in state.diffs:
-            matched = match_specs(d["xpath"], specs)
-            if matched:
-                state.current_diff = d
-                state.relevant_specs = matched
-                break
+        clusters = cluster_diffs(diffs)
+        cluster = clusters[0]
 
-        if not state.current_diff:
-            state.status = "FAILED"
-            break
+        slice_obj = find_slice(xslt_tree, cluster, specs)
+        if not slice_obj:
+            return xslt_tree, "FAILED_NO_SLICE"
 
-        local_name = state.current_diff["xpath"].split("/")[-1].split("[")[0]
+        frag_xml = etree.tostring(slice_obj.fragment_node, encoding="unicode")
+        fixed_xml = llm_fix_slice(frag_xml, cluster, specs)
 
-        xslt_tree = etree.XML(state.xslt.encode())
-        nodes = find_producing_nodes(xslt_tree, local_name)
+        new_tree = tree_merge(xslt_tree, slice_obj.fragment_node, fixed_xml)
+        new_output = run_xslt(new_tree, input_xml)
+        new_diffs = diff_xml(new_output, target_xml)
 
-        if not nodes:
-            state.status = "FAILED"
-            break
+        cont, status = should_continue(diffs, new_diffs, seen_clusters, cluster)
+        if not cont:
+            return new_tree, status
 
-        boundary = expand_to_safe_boundary(nodes[0])
-        if not boundary:
-            state.status = "FAILED"
-            break
+        seen_clusters.add(tuple(d.xpath for d in cluster))
+        xslt_tree = new_tree
 
-        frag, line_range = extract_slice(xslt_tree, boundary)
-
-        fixed = llm_fix_slice(frag, state.relevant_specs)
-        new_xslt = merge_slice(state.xslt, line_range, fixed)
-
-        new_output = run_xslt(new_xslt, state.input_xml)
-        new_diffs = diff_xml(new_output, state.target_xml)
-
-        decision = check_termination(state.diffs, new_diffs)
-        if decision != "CONTINUE":
-            state.status = decision
-            break
-
-        state.xslt = new_xslt
-
-    return state
+    return xslt_tree, "MAX_ITERATIONS"

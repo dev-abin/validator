@@ -1,6 +1,12 @@
-def check_termination(prev_diffs, new_diffs):
+def should_continue(old_diffs, new_diffs, seen_clusters, current_cluster):
     if not new_diffs:
-        return "DONE"
-    if len(new_diffs) >= len(prev_diffs):
-        return "FAILED"
-    return "CONTINUE"
+        return False, "DONE"
+
+    if len(new_diffs) >= len(old_diffs):
+        return False, "NO_PROGRESS"
+
+    cluster_key = tuple(d.xpath for d in current_cluster)
+    if cluster_key in seen_clusters:
+        return False, "STUCK"
+
+    return True, "CONTINUE"
