@@ -27,6 +27,14 @@ def save_xslt(xslt: str, path: str = "data/output.xslt") -> None:
 # ENTRY POINT
 # =========================
 
+from spec_normaliser import normalize_specs
+from agent import run_mv_ctr
+
+
+specs = normalize_specs(read_specs())
+updated = run_mv_ctr(xslt, input_xml, target_xml, specs, apply_xslt)
+    
+    
 def main():
     graph = build_graph()
 
