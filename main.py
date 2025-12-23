@@ -1,57 +1,67 @@
-from graph import build_graph
-from state import AgentState
-from pathlib import Path
+from state import FixState
+from xslt_runner import run_xslt
+from xml_diff import diff_xml
+from spec_matcher import match_specs
+from xslt_slicer import (
+    find_producing_nodes,
+    expand_to_safe_boundary,
+    extract_slice
+)
+from llm_fix import llm_fix_slice
+from merger import merge_slice
+from termination import check_termination
+from lxml import etree
 
 
-# =========================
-# I/O ADAPTERS (BORING BY DESIGN)
-# =========================
+def fix_xslt(xslt, input_xml, target_xml, specs, max_iters=10):
+    state = FixState(xslt, input_xml, target_xml, specs)
 
-def load_xslt(path: str = "data/input.xslt") -> str:
-    return Path(path).read_text(encoding="utf-8")
+    for _ in range(max_iters):
+        state.output_xml = run_xslt(state.xslt, state.input_xml)
+        state.diffs = diff_xml(state.output_xml, state.target_xml)
 
+        if not state.diffs:
+            state.status = "DONE"
+            break
 
-def load_input_xml(path: str = "data/input.xml") -> str:
-    return Path(path).read_text(encoding="utf-8")
+        for d in state.diffs:
+            matched = match_specs(d["xpath"], specs)
+            if matched:
+                state.current_diff = d
+                state.relevant_specs = matched
+                break
 
+        if not state.current_diff:
+            state.status = "FAILED"
+            break
 
-def load_target_xml(path: str = "data/target.xml") -> str:
-    return Path(path).read_text(encoding="utf-8")
+        local_name = state.current_diff["xpath"].split("/")[-1].split("[")[0]
 
+        xslt_tree = etree.XML(state.xslt.encode())
+        nodes = find_producing_nodes(xslt_tree, local_name)
 
-def save_xslt(xslt: str, path: str = "data/output.xslt") -> None:
-    Path(path).write_text(xslt, encoding="utf-8")
+        if not nodes:
+            state.status = "FAILED"
+            break
 
+        boundary = expand_to_safe_boundary(nodes[0])
+        if not boundary:
+            state.status = "FAILED"
+            break
 
-# =========================
-# ENTRY POINT
-# =========================
+        frag, line_range = extract_slice(xslt_tree, boundary)
 
-from spec_normaliser import normalize_specs
-from agent import run_mv_ctr
+        fixed = llm_fix_slice(frag, state.relevant_specs)
+        new_xslt = merge_slice(state.xslt, line_range, fixed)
 
+        new_output = run_xslt(new_xslt, state.input_xml)
+        new_diffs = diff_xml(new_output, state.target_xml)
 
-specs = normalize_specs(read_specs())
-updated = run_mv_ctr(xslt, input_xml, target_xml, specs, apply_xslt)
-    
-    
-def main():
-    graph = build_graph()
+        decision = check_termination(state.diffs, new_diffs)
+        if decision != "CONTINUE":
+            state.status = decision
+            break
 
-    state = AgentState(
-        xslt=load_xslt(),
-        input_xml=load_input_xml(),
-        target_xml=load_target_xml()
-    )
+        state.xslt = new_xslt
 
-    final_state = graph.invoke(state)
-
-    if final_state.phase == "DONE":
-        save_xslt(final_state.xslt)
-        print("XSLT stabilization completed successfully.")
-    else:
-        print(f"XSLT stabilization ended in phase: {final_state.phase}")
-
-
-if __name__ == "__main__":
-    main()
+    return state
