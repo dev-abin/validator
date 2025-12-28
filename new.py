@@ -1,56 +1,311 @@
-import copy
-import json
-import time
-from pathlib import Path
-from collections import defaultdict
+from lxml import etree
+from copy import deepcopy
 from typing import List, Dict
 
-from lxml import etree
-
-# ==============================
-# CONFIG
-# ==============================
-
-XSLT_PATH = "initial.xslt"
-
-OUTPUT_XSLT_PATH = "refined.xslt"
-
-MAX_ITERATIONS = 8
-MODEL = "gpt-4.1"
+XSL_NS = "http://www.w3.org/1999/XSL/Transform"
+XSL = f"{{{XSL_NS}}}"
 
 
-# ==============================
-# IO HELPERS
-# ==============================
+# ============================================================
+# Diff handling
+# ============================================================
 
-def read_file(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
+def get_anchor_xpath(output_xpath: str) -> str:
+    parts = [p for p in output_xpath.split("/") if p]
+    if len(parts) <= 2:
+        return "/" + "/".join(parts)
 
-def write_file(path: str, content: str):
-    Path(path).write_text(content, encoding="utf-8")
+    # Heuristic: drop leaf AND value-level nodes
+    VALUE_NODES = {
+        "Amount", "BaseAmount", "TotalAmount", "Tax", "TaxCode",
+        "DescText", "Remark", "ID", "Code"
+    }
 
-def parse_xml(xml: str) -> etree._Element:
-    return etree.XML(xml.encode())
+    while len(parts) > 2 and parts[-1] in VALUE_NODES:
+        parts.pop()
 
-# ==============================
-# SPEC VALIDATION (PLUG-IN)
-# ==============================
+    return "/" + "/".join(parts)
 
-def validate_against_specs(xslt_str: str) -> List[Dict]:
+def has_extra(diffs):
+    return any(d["diff_type"] == "EXTRA" for d in diffs)
+
+def has_missing(diffs):
+    return any(d["diff_type"] == "MISSING" for d in diffs)
+
+
+def group_diffs_by_anchor(diffs: List[Dict]) -> Dict[str, List[Dict]]:
+    grouped = {}
+    for d in diffs:
+        anchor = get_anchor_xpath(d["output_xpath"])
+        grouped.setdefault(anchor, []).append(d)
+    return grouped
+
+
+def anchor_priority(diffs: List[Dict]) -> int:
     """
-    MUST RETURN spec_diffs in the SAME STRUCTURE you already use.
-    This is the ONLY external dependency.
+    EXTRA → 0
+    MISSING → 1
+    COUNT_MISMATCH → 2
     """
-    raise NotImplementedError("Hook your existing spec validation here")
+    types = {d["diff_type"] for d in diffs}
+    if types == {"EXTRA"}:
+        return 0
+    if types == {"MISSING"}:
+        return 1
+    return 2
 
 
-import ast
+# ============================================================
+# XSLT navigation
+# ============================================================
+
+def parse_xslt(xslt_str: str) -> etree._Element:
+    return etree.XML(xslt_str.encode("utf-8"))
+
+
+def local_name(node):
+    return etree.QName(node).localname
+
+
+def find_literal_nodes(root, tag_name):
+    return root.xpath(f"//*[local-name()='{tag_name}']")
+
+
+def score_match(node, anchor_parts):
+    score = 0
+    cur = node
+    for expected in reversed(anchor_parts):
+        cur = cur.getparent()
+        if cur is None:
+            break
+        if local_name(cur) == expected:
+            score += 1
+        else:
+            break
+    return score
+
+
+def locate_best_node(root, anchor_xpath: str):
+    parts = [p for p in anchor_xpath.split("/") if p]
+    if not parts:
+        return None
+
+    leaf = parts[-1]
+    candidates = find_literal_nodes(root, leaf)
+
+    if not candidates:
+        return None
+
+    scored = [(score_match(c, parts[:-1]), c) for c in candidates]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    best_score, best_node = scored[0]
+    if best_score == 0:
+        return None
+
+    return best_node
+
+
+
+def find_loop_owner(node):
+    cur = node
+    while cur is not None:
+        if cur.tag in (XSL + "for-each", XSL + "apply-templates"):
+            return cur
+
+        # Literal element that contains a for-each → treat as owner
+        if any(
+            child.tag in (XSL + "for-each", XSL + "apply-templates")
+            for child in cur
+        ):
+            return cur
+
+        cur = cur.getparent()
+    return None
+
+
+
+# ============================================================
+# Snippet + Context
+# ============================================================
+
+def extract_snippet(loop_node) -> str:
+    return etree.tostring(loop_node, pretty_print=True, encoding="unicode")
+
+
+def extract_context(loop_node) -> str:
+    """
+    Minimal read-only context:
+    parent xsl:for-each nodes only.
+    """
+    ctx = []
+    cur = loop_node.getparent()
+    while cur is not None:
+        if cur.tag == XSL + "for-each":
+            ctx.append(etree.tostring(cur, pretty_print=True, encoding="unicode"))
+        cur = cur.getparent()
+    return "\n".join(ctx)
+
+
+# ============================================================
+# Prompt
+# ============================================================
+
+def build_prompt(anchor, diffs, snippet, context) -> str:
+    return f"""
+You are fixing ONE XSLT BLOCK.
+
+ANCHOR:
+{anchor}
+
+DIFFS:
+{diffs}
+
+READ-ONLY CONTEXT (do not modify):
+{context}
+
+EDITABLE BLOCK (ONLY THIS):
+```xml
+{snippet}
+```
+
+RULES:
+
+* Modify ONLY the editable block
+* Do NOT change element names or namespaces
+* Fix ONLY the listed diffs
+* COUNT_MISMATCH → fix loop structure
+* EXTRA → add guards or remove emission
+* MISSING → add missing output in correct loop
+
+Return ONLY valid XSLT XML. No explanation.
+"""
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+def xslt_compiles(xslt_root) -> bool:
+    try:
+        etree.XSLT(xslt_root)
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# DOM patching
+# ============================================================
+
+def replace_node(old_node, new_node):
+    parent = old_node.getparent()
+    index = list(parent).index(old_node)
+    parent.remove(old_node)
+    parent.insert(index, new_node)
+
+
+def anchor_has_extra(diffs):
+    return any(d["diff_type"] == "EXTRA" for d in diffs)
+
+
+# ============================================================
+# Main refinement function
+# ============================================================
+
+def refine_xslt(xslt_str: str, spec_validated_diff: List[Dict]) -> str:
+    xslt_root = parse_xslt(xslt_str)
+    snapshot = deepcopy(xslt_root)
+
+    grouped = group_diffs_by_anchor(spec_validated_diff)
+    
+    print(grouped)
+
+    ordered_anchors = sorted(
+        grouped.keys(),
+        key=lambda a: anchor_priority(grouped[a])
+    )
+    
+    print(ordered_anchors)
+
+    locked = set()
+
+    for anchor in ordered_anchors:
+        if anchor in locked:
+            continue
+
+        diffs = grouped[anchor]
+
+        literal_node = locate_best_node(xslt_root, anchor)
+        print(literal_node)
+        if literal_node is None:
+            continue
+
+        loop_node = find_loop_owner(literal_node)
+        print(loop_node)
+        if loop_node is None:
+            continue
+
+        snippet = extract_snippet(loop_node)
+        context = extract_context(loop_node)
+        
+        print(snippet)
+        print(context)
+
+        prompt = build_prompt(anchor, diffs, snippet, context)
+        
+        for _ in range(2):
+            fixed_snippet = get_llm_response(prompt)
+            try:
+                new_loop = etree.XML(fixed_snippet.encode("utf-8"))
+                break
+            except Exception:
+                new_loop = None
+
+        if new_loop is None:
+            xslt_root = deepcopy(snapshot)
+            continue
+        new_loop = None
+
+        test_root = deepcopy(xslt_root)
+        test_literal = locate_best_node(test_root, anchor)
+        test_loop = find_loop_owner(test_literal)
+
+        replace_node(test_loop, new_loop)
+
+        if not xslt_compiles(test_root):
+            xslt_root = deepcopy(snapshot)
+            continue
+
+        # If this anchor had EXTRA, ensure snippet actually changed
+        if anchor_has_extra(diffs):
+            if etree.tostring(loop_node) == etree.tostring(new_loop):
+                xslt_root = deepcopy(snapshot)
+                continue
+
+        # Commit
+        # Enforce semantic change for EXTRA / MISSING
+        if (has_extra(diffs) or has_missing(diffs)) and \
+        etree.tostring(loop_node) == etree.tostring(new_loop):
+            xslt_root = deepcopy(snapshot)
+            continue
+
+        # Commit
+        replace_node(loop_node, new_loop)
+        snapshot = deepcopy(xslt_root)
+        locked.add(anchor)
+
+
+
+    return etree.tostring(xslt_root, pretty_print=True, encoding="unicode")
+
 
 def parse_diff(file_path):
     """
     Reads a text file containing string-represented dictionaries 
     and returns a list of dictionaries.
     """
+    import ast
     data_list = []
     
     try:
@@ -71,352 +326,24 @@ def parse_diff(file_path):
     except FileNotFoundError:
         print(f"Error: The file '{file_path}' was not found.")
         return []
-
-
-
-
-# ==============================
-# XSLT APPLY (PLUG-IN)
-# ==============================
-
-def apply_xslt(xslt_str: str, input_xml: str) -> str:
-    xslt_root = etree.XML(xslt_str.encode())
-    transform = etree.XSLT(xslt_root)
-    return str(transform(etree.XML(input_xml.encode())))
-
-# ==============================
-# DIFF CLASSIFICATION
-# ==============================
-
-def classify_diffs(spec_diffs: List[Dict]):
-    removals, count_fixes, missing = [], [], []
-
-    for d in spec_diffs:
-        cat = d.get("issue_category", "")
-        if "Remove from XSLT" in cat:
-            removals.append(d)
-        elif "Wrong Count" in cat:
-            count_fixes.append(d)
-        elif "Missing output" in cat:
-            missing.append(d)
-
-    return removals, count_fixes, missing
-
-def xpath_parent(xpath: str) -> str:
-    return "/".join(xpath.rstrip("/").split("/")[:-1])
-
-# ==============================
-# XSLT TREE OPS
-# ==============================
-
-def remove_xpath(tree: etree._Element, output_xpath: str):
-    """
-    Remove XSLT instructions that generate an overgenerated output element.
-    This operates on the XSLT AST, not on output XML paths.
-    """
-
-    leaf = output_xpath.rstrip("/").split("/")[-1]
-
-    ns = {
-        "xsl": "http://www.w3.org/1999/XSL/Transform"
-    }
-
-    removed = False
-
-    # 1️⃣ Literal output elements <PaymentCard>
-    for node in tree.xpath(f"//*[local-name()='{leaf}']"):
-        parent = node.getparent()
-        if parent is not None:
-            parent.remove(node)
-            print("removed here","//*[local-name()")
-            removed = True
-
-    # 2️⃣ xsl:element name="PaymentCard"
-    for node in tree.xpath(
-        f"//xsl:element[@name='{leaf}']",
-        namespaces=ns
-    ):
-        parent = node.getparent()
-        if parent is not None:
-            parent.remove(node)
-            print("removed here","//xsl:element[@name=")
-            removed = True
-
-    # 3️⃣ xsl:for-each selecting PaymentCard
-    for node in tree.xpath(
-        f"//xsl:for-each[contains(@select, '{leaf}')]",
-        namespaces=ns
-    ):
-        parent = node.getparent()
-        if parent is not None:
-            parent.remove(node)
-            print("removed here","//xsl:for-each[contains(@select")
-            removed = True
-
-    # 4️⃣ xsl:copy-of selecting PaymentCard
-    for node in tree.xpath(
-        f"//xsl:copy-of[contains(@select, '{leaf}')]",
-        namespaces=ns
-    ):
-        parent = node.getparent()
-        if parent is not None:
-            parent.remove(node)
-            print("removed here","//xsl:copy-of[contains(@select")
-            removed = True
-
-    if not removed:
-        print(f"[WARN] Overgenerated node '{leaf}' not found in XSLT")
-
-
-def extract_slice(tree: etree._Element, anchor_xpath: str) -> etree._Element:
-    """
-    Robust slice extractor for monolithic XSLTs.
-
-    Resolution order:
-    1. Literal element with local-name == anchor leaf
-    2. xsl:for-each whose select ends with anchor leaf
-    3. Closest ancestor that constructs the anchor leaf
-    """
-
-    anchor_leaf = anchor_xpath.rstrip("/").split("/")[-1]
-
-    ns = {
-        "xsl": "http://www.w3.org/1999/XSL/Transform"
-    }
-
-    # 1️⃣ Literal element construction
-    elems = tree.xpath(f"//*[local-name()='{anchor_leaf}']")
-    if elems:
-        return copy.deepcopy(elems[0])
-
-    # 2️⃣ for-each selecting the anchor
-    for_each = tree.xpath(
-        f"//xsl:for-each[contains(@select, '{anchor_leaf}')]",
-        namespaces=ns
-    )
-    if for_each:
-        return copy.deepcopy(for_each[0])
-
-    # 3️⃣ xsl:element name="Anchor"
-    xsl_elem = tree.xpath(
-        f"//xsl:element[@name='{anchor_leaf}']",
-        namespaces=ns
-    )
-    if xsl_elem:
-        return copy.deepcopy(xsl_elem[0])
-
-    raise ValueError(f"Anchor not found in XSLT by heuristic: {anchor_xpath}")
-
-
-def replace_slice(tree: etree._Element, anchor_xpath: str, new_slice: etree._Element):
-    anchor_leaf = anchor_xpath.rstrip("/").split("/")[-1]
-
-    ns = {"xsl": "http://www.w3.org/1999/XSL/Transform"}
-
-    candidates = (
-        tree.xpath(f"//*[local-name()='{anchor_leaf}']") +
-        tree.xpath(f"//xsl:for-each[contains(@select, '{anchor_leaf}')]", namespaces=ns) +
-        tree.xpath(f"//xsl:element[@name='{anchor_leaf}']", namespaces=ns)
-    )
-
-    if not candidates:
-        raise ValueError(f"Anchor not found for replacement: {anchor_xpath}")
-
-    old = candidates[0]
-    parent = old.getparent()
-    idx = parent.index(old)
-
-    parent.remove(old)
-    parent.insert(idx, new_slice)
-
-# ==============================
-# LLM CORE — FULL IMPLEMENTATION
-# ==============================
-
-def llm_fix_slice(slice_xml: str, diffs: List[Dict]) -> str:
-    """
-    HARD CONTRACT:
-    - Fix iteration cardinality first
-    - Use expected_source_path as iteration anchor
-    - Explode loops when PaxSegmentRefID-like rules apply
-    - Remove overgenerated nodes
-    - Add missing mandatory nodes
-    - Preserve namespaces
-    - Output VALID XSLT XML ONLY
-    """
-
-    system_prompt = """
-    You are a senior XSLT architect fixing a production transformation.
-
-    Rules you MUST follow:
-    1. Cardinality correctness is NON-NEGOTIABLE.
-    2. COUNT_MISMATCH means iteration logic is wrong — FIX LOOPS FIRST.
-    3. If a parent has multiple logical associations (e.g. PaxSegmentRefID),
-    you MUST explode the parent node, not nest the association.
-    4. Remove nodes explicitly marked as overgenerated.
-    5. Add nodes explicitly marked as missing.
-    6. Do NOT invent data.
-    7. Do NOT change unrelated logic.
-    8. Output ONLY valid XSLT XML — no commentary.
-    9. You MUST preserve the outermost element of the slice exactly
-    (same element name, same namespace, same position).
-    10. For every COUNT_MISMATCH diff, the number of output elements
-        produced by this slice MUST match the target count implied by the diff.
-    """
-
-
-    user_prompt = f"""
-    === BROKEN XSLT SLICE ===
-    {slice_xml}
-
-    === SPEC-VALIDATED DIFFS FOR THIS SLICE ===
-    {json.dumps(diffs, indent=2)}
-
-    === TASK ===
-    Rewrite this slice so that ALL above diffs are resolved.
-    """
-
-
-    resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-
-    return resp.choices[0].message.content.strip()
-
-# ==============================
-# MAIN REFINEMENT LOOP
-# ==============================
-def prune_dominated_anchors(anchors: list[str]) -> list[str]:
-    """
-    Keep only highest (structural) anchors.
-    If /A/B is kept, drop /A/B/C, /A/B/D, etc.
-    """
-    anchors = sorted(anchors, key=lambda x: x.count("/"))
-    kept = []
-    # print(anchors)
-    print(len(anchors))
-    for a in anchors:
-        if not any(a.startswith(k + "/") for k in kept):
-            kept.append(a)
-        
-    # print(kept)
-    print(len(kept))
-    return kept
-
-
-def refine(xslt_str: str) -> str:
-    """
-    Iteratively refines a monolithic XSLT until spec diffs converge to zero.
-
-    Safety guarantees:
-    - Spec diffs must strictly decrease each iteration
-    - Structural anchors are dominance-pruned
-    - Invalid XSLT is rejected immediately
-    - Infinite loops and regressions are prevented
-    """
-
-    xslt_tree = etree.XML(xslt_str.encode())
-    prev_diff_count = None
     
-    spec_diffs = parse_diff('spec_diffs.txt')
+import copy
+import json
+import time
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        print(f"\n===== ITERATION {iteration} =====")
-
-        # ---- Spec validation (ground truth) ----
-        # spec_diffs = validate_against_specs(xslt_str)
-        curr_diff_count = len(spec_diffs)
-
-        print(f"Spec diffs: {curr_diff_count}")
-
-        # ---- Convergence ----
-        if curr_diff_count == 0:
-            print("✅ Converged: no spec diffs remaining")
-            return xslt_str
-
-        # ---- Progress monotonicity check ----
-        if prev_diff_count is not None and curr_diff_count >= prev_diff_count:
-            raise RuntimeError(
-                f"❌ No progress detected: prev={prev_diff_count}, curr={curr_diff_count}"
-            )
-        prev_diff_count = curr_diff_count
-
-        # ---- Classify diffs ----
-        removals, count_fixes, _ = classify_diffs(spec_diffs)
-        print(len(count_fixes))
-        # print(count_fixes)
-
-        # ---- Phase 1: Remove overgeneration ----
-        for d in removals:
-            print(f"Removing overgenerated node: {d['output_xpath']}")
-            remove_xpath(xslt_tree, d["output_xpath"])
-
-        # ---- Phase 2: Build raw anchor groups ----
-        raw_groups = defaultdict(list)
-        for d in count_fixes:
-            anchor = d.get("expected_source_path") or xpath_parent(d["output_xpath"])
-            raw_groups[anchor].append(d)
-            
-        # print(raw_groups)
-        print(len(raw_groups))
-
-        if not raw_groups:
-            raise RuntimeError(
-                "❌ Spec diffs remain but no fixable COUNT_MISMATCH anchors found"
-            )
-
-        # ---- Phase 3: Dominance pruning (CRITICAL) ----
-        anchors = prune_dominated_anchors(list(raw_groups.keys()))
-        groups = {a: raw_groups[a] for a in anchors}
-
-        print("Anchors to fix:")
-        for a in anchors:
-            print(f"  - {a}")
-
-        # ---- Phase 4: Fix each anchor slice ----
-        for anchor, diffs in groups.items():
-            print(f"\nFixing slice @ {anchor}")
-
-            slice_el = extract_slice(xslt_tree, anchor)
-            slice_xml = etree.tostring(slice_el, pretty_print=True).decode()
-            
-            print(slice_xml)
-
-            # fixed_xml = llm_fix_slice(slice_xml, diffs)
-            # fixed_el = etree.XML(fixed_xml.encode())
-            print("assume llm fixed it")
-
-            # replace_slice(xslt_tree, anchor, fixed_el)
-
-            # ---- Structural validity check ----
-            try:
-                etree.XML(etree.tostring(xslt_tree))
-            except Exception as e:
-                raise RuntimeError(
-                    f"❌ XSLT became invalid after fixing anchor {anchor}"
-                ) from e
-
-        # ---- Update working XSLT ----
-        xslt_str = etree.tostring(xslt_tree, pretty_print=True).decode()
-
-    # ---- Hard termination ----
-    raise RuntimeError("❌ Max iterations reached without convergence")
+from lxml import etree
 
 
-# ==============================
-# ENTRY POINT
-# ==============================
+XSLT_PATH = "initial.xslt"
+
+
+def read_file(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
 
 if __name__ == "__main__":
-    xslt = read_file(XSLT_PATH)
-
-    final_xslt = refine(xslt)
-
-    write_file(OUTPUT_XSLT_PATH, final_xslt)
-
-    print("\n🎯 XSLT refinement complete.")
+    xslt_str = read_file(XSLT_PATH)
+    spec_diffs = parse_diff('spec_diffs.txt')
+    fixed_xslt = refine_xslt(xslt_str, spec_diffs)
