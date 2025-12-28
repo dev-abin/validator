@@ -109,11 +109,64 @@ def xpath_parent(xpath: str) -> str:
 # XSLT TREE OPS
 # ==============================
 
-def remove_xpath(tree: etree._Element, xpath: str):
-    for node in tree.xpath(xpath):
+def remove_xpath(tree: etree._Element, output_xpath: str):
+    """
+    Remove XSLT instructions that generate an overgenerated output element.
+    This operates on the XSLT AST, not on output XML paths.
+    """
+
+    leaf = output_xpath.rstrip("/").split("/")[-1]
+
+    ns = {
+        "xsl": "http://www.w3.org/1999/XSL/Transform"
+    }
+
+    removed = False
+
+    # 1️⃣ Literal output elements <PaymentCard>
+    for node in tree.xpath(f"//*[local-name()='{leaf}']"):
         parent = node.getparent()
         if parent is not None:
             parent.remove(node)
+            print("removed here","//*[local-name()")
+            removed = True
+
+    # 2️⃣ xsl:element name="PaymentCard"
+    for node in tree.xpath(
+        f"//xsl:element[@name='{leaf}']",
+        namespaces=ns
+    ):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+            print("removed here","//xsl:element[@name=")
+            removed = True
+
+    # 3️⃣ xsl:for-each selecting PaymentCard
+    for node in tree.xpath(
+        f"//xsl:for-each[contains(@select, '{leaf}')]",
+        namespaces=ns
+    ):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+            print("removed here","//xsl:for-each[contains(@select")
+            removed = True
+
+    # 4️⃣ xsl:copy-of selecting PaymentCard
+    for node in tree.xpath(
+        f"//xsl:copy-of[contains(@select, '{leaf}')]",
+        namespaces=ns
+    ):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+            print("removed here","//xsl:copy-of[contains(@select")
+            removed = True
+
+    if not removed:
+        print(f"[WARN] Overgenerated node '{leaf}' not found in XSLT")
+
 
 def extract_slice(tree: etree._Element, anchor_xpath: str) -> etree._Element:
     """
@@ -245,11 +298,14 @@ def prune_dominated_anchors(anchors: list[str]) -> list[str]:
     """
     anchors = sorted(anchors, key=lambda x: x.count("/"))
     kept = []
-
+    # print(anchors)
+    print(len(anchors))
     for a in anchors:
         if not any(a.startswith(k + "/") for k in kept):
             kept.append(a)
-
+        
+    # print(kept)
+    print(len(kept))
     return kept
 
 
@@ -292,6 +348,8 @@ def refine(xslt_str: str) -> str:
 
         # ---- Classify diffs ----
         removals, count_fixes, _ = classify_diffs(spec_diffs)
+        print(len(count_fixes))
+        # print(count_fixes)
 
         # ---- Phase 1: Remove overgeneration ----
         for d in removals:
@@ -303,6 +361,9 @@ def refine(xslt_str: str) -> str:
         for d in count_fixes:
             anchor = d.get("expected_source_path") or xpath_parent(d["output_xpath"])
             raw_groups[anchor].append(d)
+            
+        # print(raw_groups)
+        print(len(raw_groups))
 
         if not raw_groups:
             raise RuntimeError(
@@ -323,6 +384,8 @@ def refine(xslt_str: str) -> str:
 
             slice_el = extract_slice(xslt_tree, anchor)
             slice_xml = etree.tostring(slice_el, pretty_print=True).decode()
+            
+            print(slice_xml)
 
             # fixed_xml = llm_fix_slice(slice_xml, diffs)
             # fixed_el = etree.XML(fixed_xml.encode())
